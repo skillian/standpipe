@@ -75,15 +75,8 @@ func main() {
 	rwsc, err := rwscer.ReadWriteSeekCloser()
 	panicOnError(err)
 
-	sp := standpipe.NewV1Pipe(rwsc, args.MustGet(pageSize).(int))
-
-	defer sp.Close()
-
-	gs := goroState{
-		wg:   sync.WaitGroup{},
-		errs: make(chan error, 2),
-		stop: make(chan struct{}, 2),
-	}
+	rc, wc, err := standpipe.NewV1Pipe(rwsc, args.MustGet(pageSize).(int))
+	panicOnError(err)
 
 	sigs := make(chan os.Signal, 8)
 	signal.Notify(sigs, os.Interrupt)
@@ -91,53 +84,49 @@ func main() {
 	go func() {
 		for range sigs {
 			pprof.Lookup("goroutine").WriteTo(os.Stderr, 2)
-			gs.stop <- struct{}{}
-			os.Exit(-1)
+			panicOnError(rc.Close())
+			panicOnError(wc.Close())
 		}
 	}()
 
-	gs.wg.Add(2)
+	wg := sync.WaitGroup{}
+	wg.Add(2)
 
-	go gs.goCopy("reader", os.Stdout, sp)
-	go gs.goCopy("writer", sp, os.Stdin)
+	errs := make(chan error, 2)
+
+	go writePipe(&wg, wc, os.Stdin, errs)
+	go readPipe(&wg, os.Stdout, rc, errs)
 
 	go func() {
-		for err := range gs.errs {
+		for err := range errs {
 			panicOnError(err)
 		}
 	}()
 
-	gs.wg.Wait()
+	wg.Wait()
 }
 
-type goroState struct {
-	wg   sync.WaitGroup
-	errs chan error
-	stop chan struct{}
+func doCopy(wg *sync.WaitGroup, name string, w io.Writer, r io.Reader, errs chan<- error) {
+	defer wg.Done()
+	logger.Debug1("Starting %s...", name)
+	_, err := io.Copy(w, r)
+	logger.Info1("Done %s.", name)
+	if err != nil {
+		errs <- err
+	}
 }
 
-func (s *goroState) goCopy(name string, w io.Writer, r io.Reader) {
-	defer func() {
-		s.wg.Done()
-		fmt.Fprintln(os.Stderr, "returning from", name)
-	}()
-	fmt.Fprintln(os.Stderr, "starting", name)
-	for {
-		select {
-		case _, ok := <-s.stop:
-			if ok {
-				return
-			}
-		default:
-			break
-		}
-		_, err := io.Copy(w, r)
-		if err != nil {
-			s.errs <- errors.ErrorfWithCause(
-				err, "error copying from %T to %T", r, w)
-			s.stop <- struct{}{}
-			return
-		}
+func readPipe(wg *sync.WaitGroup, w io.Writer, r *standpipe.V1PipeReader, errs chan<- error) {
+	doCopy(wg, "pipe reader", w, r, errs)
+	if err := r.Close(); err != nil {
+		errs <- err
+	}
+}
+
+func writePipe(wg *sync.WaitGroup, w *standpipe.V1PipeWriter, r io.Reader, errs chan<- error) {
+	doCopy(wg, "pipe writer", w, r, errs)
+	if err := w.Close(); err != nil {
+		errs <- err
 	}
 }
 

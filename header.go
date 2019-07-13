@@ -53,7 +53,7 @@ type V1Header struct {
 
 	// ReadBufferIndex stores the index into the ReadBuffer where reading
 	// stopped last.
-	ReadBufferIndex int
+	ReadBufferIndex int64
 }
 
 const v1HeaderSize = unsafe.Sizeof(V1Header{})
