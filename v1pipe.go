@@ -9,48 +9,73 @@ import (
 	"github.com/skillian/errors"
 )
 
-// V1Pipe is the first implementation of a standpipe.
+// V1Pipe is the first implementation of a standpipe.  The version is included
+// in the datatype because the same standpipe executable needs to be able to
+// handle multiple standpipe versions.
 type V1Pipe struct {
+	// cond is the condition variable signalled when there is data
+	// available in the standpipe to be read or if no more data will be
+	// written.
 	cond sync.Cond
+
+	// flag holds flags to indicate the pipe's state.
+	flag v1flag
+
+	// rbuf is the in-memory buffer of data currently being read from
+	// the standpipe.
 	rbuf *buffer
+
+	// wbuf is the in-memory buffer of the data to be written to the
+	// standpipe.
 	wbuf *buffer
-	offs []int64 // offsets into the file.
-	offi int     // offset into offs of the next read.
+
+	// offs is an ordered slice of offsets into the standpipe file with
+	// data yet to be read out.
+	offs []int64
+
+	// offi is the offset index
+	offi int
+
 	rwsc ReadWriteSeekCloser
 	free []int64 // available offsets into the file
-	roff int64
-	woff int64
-	flag v1flag
 	head V1Header
 }
 
-// V1PipeReader is the reader half of the pipe.
+// V1PipeReader reads from the V1Pipe
 type V1PipeReader V1Pipe
 
-// Read implements io.Reader
-func (r *V1PipeReader) Read(p []byte) (int, error) {
-	return ((*V1Pipe)(r)).Read(p)
-}
+func (r *V1PipeReader) pp() *V1Pipe                { return (*V1Pipe)(r) }
+func (r *V1PipeReader) Read(p []byte) (int, error) { return r.pp().Read(p) }
 
-// Close implements io.Closer
+// Close the reader.  The writer will proceed with its writing into the pipe.
 func (r *V1PipeReader) Close() error {
-	return ((*V1Pipe)(r)).readerOrWriterClose()
+	pp := r.pp()
+	pp.flag.setFlags(v1DumpDone)
+	return pp.Close()
 }
 
-// V1PipeWriter is the writer half of the pipe
+// V1PipeWriter writes to the V1Pipe
 type V1PipeWriter V1Pipe
 
-// Write implements io.Writer
-func (w *V1PipeWriter) Write(p []byte) (int, error) {
-	return ((*V1Pipe)(w)).Write(p)
-}
+func (w *V1PipeWriter) pp() *V1Pipe                 { return (*V1Pipe)(w) }
+func (w *V1PipeWriter) Write(p []byte) (int, error) { return w.pp().Write(p) }
 
-// Close implements io.Closer
+// Close the writer.  The reader will continue to read from the pipe.
 func (w *V1PipeWriter) Close() error {
-	pp := ((*V1Pipe)(w))
-	err := pp.readerOrWriterClose()
-	pp.cond.Signal()
-	return err
+	pp := w.pp()
+	pp.flag.setFlags(v1LoadDone)
+
+	// make sure the write buffer is flushed:
+	pp.cond.L.Lock()
+	length := pp.wbuf.Len()
+	pp.cond.L.Unlock()
+	if length > 0 {
+		pp.head.LastBufferLength = int64(length)
+		if err := pp.nextWBuf(); err != nil {
+			return err
+		}
+	}
+	return pp.Close()
 }
 
 // NewV1Pipe creates a new stand pipe from the given rwsc.
@@ -83,8 +108,12 @@ func NewV1Pipe(rwsc ReadWriteSeekCloser, pageSize int) (*V1PipeReader, *V1PipeWr
 	return (*V1PipeReader)(pp), (*V1PipeWriter)(pp), nil
 }
 
-// Close persists the state of the pipe so it can be resumed later.
+// Close implements io.Closer.
 func (pp *V1Pipe) Close() (err error) {
+	if !pp.flag.hasAllFlags(v1LoadDone | v1DumpDone) {
+		logger.Debug1("    %v.Close():  one pipe half closed.", Repr(pp))
+		return nil
+	}
 	logger.Debug1(" -> %v.Close()", Repr(pp))
 	defer func() { logger.Debug2(" <- %v.Close() %v", Repr(pp), err) }()
 	pp.cond.L.Lock()
@@ -105,17 +134,6 @@ func (pp *V1Pipe) Close() (err error) {
 			err, "failed to write offsets")
 	}
 	return pp.seekAndWriteHeader()
-}
-
-// readerOrWriterClose is called by both V1PipeReader and V1PipeWriter to
-// close the pipe after the last of the two is done.
-func (pp *V1Pipe) readerOrWriterClose() error {
-	// if the flag's not set, then we're the first one to close.
-	if atomic.CompareAndSwapUint32(
-		(*uint32)(&pp.flag), 0, uint32(v1done)) {
-		return nil
-	}
-	return pp.Close()
 }
 
 func (pp *V1Pipe) Read(p []byte) (n int, err error) {
@@ -208,9 +226,6 @@ func (pp *V1Pipe) destructivelyWriteInt64s(vs []int64) error {
 }
 
 func (pp *V1Pipe) nextRBuf() error {
-	if pp.isQuit() {
-		return io.EOF
-	}
 	pp.cond.L.Lock()
 	if !pp.waitRead() {
 		return io.EOF
@@ -234,21 +249,17 @@ func (pp *V1Pipe) nextRBuf() error {
 
 func (pp *V1Pipe) waitRead() bool {
 	for {
-		f := pp.flag.value()
-		if (f&v1done == v1done) || (f&v1quit == v1quit) {
-			return false
-		}
 		if len(pp.offs) > pp.offi {
 			return true
+		}
+		if pp.flag.hasAllFlags(v1LoadDone) {
+			return false
 		}
 		pp.cond.Wait()
 	}
 }
 
 func (pp *V1Pipe) nextWBuf() (err error) {
-	if pp.isQuit() {
-		return io.EOF
-	}
 	pp.cond.L.Lock()
 	offset, whence := pp.nextWBufSeek()
 	offset, err = pp.rwsc.Seek(offset, whence)
@@ -263,8 +274,14 @@ func (pp *V1Pipe) nextWBuf() (err error) {
 			err, "error while writing from write buffer into %v",
 			pp.rwsc)
 	}
+	if len(pp.offs) == cap(pp.offs) && pp.offi > 0 {
+		copy(pp.offs[0:], pp.offs[pp.offi:])
+		pp.offs = pp.offs[:len(pp.offs)-pp.offi]
+		pp.offi = 0
+	}
 	pp.offs = append(pp.offs, offset)
 	pp.wbuf.Reset()
+	err = pp.seekAndWriteHeader()
 	pp.cond.Signal()
 	pp.cond.L.Unlock()
 	return nil
@@ -287,19 +304,15 @@ func (pp *V1Pipe) nextWBufSeek() (offset int64, whence int) {
 	return
 }
 
-func (pp *V1Pipe) isQuit() bool {
-	return pp.flag.value()&v1quit == v1quit
-}
-
-func (pp *V1Pipe) doQuit() {
-	pp.flag.setFlag(v1quit)
-}
-
 type v1flag uint32
 
 const (
-	v1done v1flag = 1 << iota
-	v1quit
+	// v1LoadDone is set when loading data into the pipe is finished but
+	// the pipe still has to be emptied.
+	v1LoadDone v1flag = 1 << iota
+
+	// v1DumpDone is set when writing data out of the pipe is done.
+	v1DumpDone
 )
 
 // value atomically loads the flag value
@@ -307,9 +320,22 @@ func (f *v1flag) value() v1flag {
 	return v1flag(atomic.LoadUint32((*uint32)(f)))
 }
 
-func (f *v1flag) setFlag(v v1flag) {
+// hasAllFlags checks if the flag has all of the flags given as its parameter
+func (f *v1flag) hasAllFlags(v v1flag) bool {
+	return f.value()&v == v
+}
+
+// hasAnyFlags returns true if any of v's bits are set in the flag.
+func (f *v1flag) hasAnyFlags(v v1flag) bool {
+	return f.value()&v != 0
+}
+
+func (f *v1flag) setFlags(v v1flag) {
 	for i := 0; i < 1000; i++ {
 		fv := f.value()
+		if fv&v == v {
+			return
+		}
 		if atomic.CompareAndSwapUint32(
 			(*uint32)(f), uint32(fv), uint32(fv|v)) {
 			return

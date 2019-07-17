@@ -3,6 +3,7 @@ package standpipe
 import (
 	"errors"
 	"io"
+	"reflect"
 	"unsafe"
 )
 
@@ -24,12 +25,15 @@ func newBuffer(capacity int) *buffer {
 	if capacity < len(b.cch) {
 		b.buf = b.cch[:0]
 		// hack the capacity:
-		(*[3]int)(unsafe.Pointer(&b.buf))[2] = capacity
+		((*reflect.SliceHeader)(unsafe.Pointer(&b.buf))).Cap = capacity
 	} else {
 		b.buf = make([]byte, 0, capacity)
 	}
 	return b
 }
+
+// Len gets the number of bytes yet to be read from the buffer:
+func (b *buffer) Len() int { return len(b.unread()) }
 
 func (b *buffer) Read(p []byte) (n int, err error) {
 	logger.Debug3(" -> %v.%s(<%d bytes>)", Repr(b), "Read", len(p))

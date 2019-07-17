@@ -37,6 +37,7 @@ type HeaderCommon struct {
 // V1Header is the header format of version 1 files.
 type V1Header struct {
 	HeaderCommon
+
 	// PageSize defines the size of every page within the standpipe file.
 	PageSize int64
 
@@ -54,6 +55,11 @@ type V1Header struct {
 	// ReadBufferIndex stores the index into the ReadBuffer where reading
 	// stopped last.
 	ReadBufferIndex int64
+
+	// LastBufferLength holds the length of the last buffer in the
+	// standpipe.  All other buffers are exactly PageSize bytes long but
+	// the last one will probably not be the right size.
+	LastBufferLength int64
 }
 
 const v1HeaderSize = unsafe.Sizeof(V1Header{})

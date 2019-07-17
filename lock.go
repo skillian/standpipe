@@ -18,13 +18,13 @@ type Mutex sync.Mutex
 
 // Lock the mutex.
 func (m *Mutex) Lock() {
-	logger.Debug2("locking %v from %v", m, getCallerName(1))
+	logger.Debug2("locking %v from %v", Repr(m), getCallerName(1))
 	((*sync.Mutex)(m)).Lock()
 }
 
 // Unlock the mutex.
 func (m *Mutex) Unlock() {
-	logger.Debug2("unlocking %v from %v", m, getCallerName(1))
+	logger.Debug2("unlocking %v from %v", Repr(m), getCallerName(1))
 	((*sync.Mutex)(m)).Unlock()
 }
 
