@@ -7,7 +7,10 @@ import (
 	"unsafe"
 )
 
-const pointerSize = unsafe.Sizeof(unsafe.Pointer(nil))
+const (
+	intSize = unsafe.Sizeof(int(0))	
+	pointerSize = unsafe.Sizeof(unsafe.Pointer(nil))
+)
 
 var (
 	errBufferEmpty = errors.New("buffer empty")
@@ -17,7 +20,7 @@ var (
 type buffer struct {
 	buf []byte
 	off int
-	cch [cacheLineSize - (4 * pointerSize)]byte
+	cch [cacheLineSize - (3*intSize + pointerSize)]byte
 }
 
 func newBuffer(capacity int) *buffer {
